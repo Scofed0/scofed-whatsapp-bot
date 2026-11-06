@@ -57,42 +57,4 @@ async function startBot() {
     const from = msg.key.remoteJid;
     const text =
       msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      "";
-
-    if (text.trim().toLowerCase() === "!menu") {
-      await sock.sendMessage(from, {
-        text: `╭━━━〔 SCOFED BOT 〕━━━╮
-┃
-┃ 👑 OWNER: SCOFED
-┃ ⚙️ PREFIX: !
-┃
-┃ 📌 GENERAL
-┃ !menu
-┃ !ping
-┃ !owner
-┃
-┃ 🛡️ GROUP
-┃ !antilink
-┃ !antisticker
-┃
-┃ 🤖 BOT
-┃ !always
-┃ !help
-┃
-╰━━━━━━━━━━━━━━━━━━╯
-        `
-      });
-    }
-
-    if (text.trim().toLowerCase() === "!ping") {
-      await sock.sendMessage(from, { text: "SCOFED BOT is online! 🚀" });
-    }
-
-    if (text.trim().toLowerCase() === "!owner") {
-      await sock.sendMessage(from, { text: "Owner: SCOFED 👑" });
-    }
-  });
-}
-
-startBot().catch(console.error);
+      msg.message.extendedTextMessage
