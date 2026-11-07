@@ -13,7 +13,7 @@ const {
 } = require("@whiskeysockets/baileys");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "10kb" }));
 
 const PORT = process.env.PORT || 3000;
 
@@ -22,6 +22,8 @@ const lastRequests = new Map();
 const reconnecting = new Set();
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+/* WELCOME MESSAGE */
 
 async function sendWelcomeOnce(sock, folder) {
   try {
@@ -38,9 +40,11 @@ async function sendWelcomeOnce(sock, folder) {
     }
 
     const userId = sock.user.id;
-    const jid = userId.split(":")[0].split("@")[0] + "@s.whatsapp.net";
+    const jid =
+      userId.split(":")[0].split("@")[0] + "@s.whatsapp.net";
 
     await sock.sendMessage(jid, { text: message });
+
     await fs.promises.writeFile(marker, "sent");
 
     console.log("Welcome sent:", jid);
@@ -48,6 +52,8 @@ async function sendWelcomeOnce(sock, folder) {
     console.error("Welcome error:", error);
   }
 }
+
+/* START WHATSAPP SESSION */
 
 async function startSession(phone, generateCode = false) {
   const folder = path.join(__dirname, "sessions", phone);
@@ -57,32 +63,135 @@ async function startSession(phone, generateCode = false) {
   const { state, saveCreds } =
     await useMultiFileAuthState(folder);
 
+  if (generateCode && state.creds.registered) {
+    return null;
+  }
+
   const sock = makeWASocket({
     auth: state,
     logger: pino({ level: "silent" }),
     printQRInTerminal: false,
-    browser: ["SCOFED BOT", "Chrome", "1.0.0"]
+    browser: ["SCOFED BOT", "Chrome", "1.0.0"],
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 30000,
+    markOnlineOnConnect: false,
+    syncFullHistory: false
   });
 
   sessions.set(phone, sock);
 
   sock.ev.on("creds.update", saveCreds);
 
+  let pairingRequested = false;
+  let pairingSettled = false;
+  let pairingTimer;
+
+  let resolvePairing;
+  let rejectPairing;
+
+  const pairingPromise = generateCode
+    ? new Promise((resolve, reject) => {
+        resolvePairing = resolve;
+        rejectPairing = reject;
+
+        pairingTimer = setTimeout(() => {
+          if (!pairingSettled) {
+            pairingSettled = true;
+
+            reject(
+              new Error("Timed out waiting for WhatsApp pairing QR event.")
+            );
+
+            if (sessions.get(phone) === sock) {
+              sessions.delete(phone);
+            }
+
+            sock.end(new Error("Pairing timeout"));
+          }
+        }, 45000);
+      })
+    : null;
+
+  function finishPairing(error, code) {
+    if (pairingSettled) return;
+
+    pairingSettled = true;
+
+    clearTimeout(pairingTimer);
+
+    if (error) {
+      rejectPairing(error);
+    } else {
+      resolvePairing(code);
+    }
+  }
+
   sock.ev.on("connection.update", async update => {
-    const { connection, lastDisconnect } = update;
+    const { connection, lastDisconnect, qr } = update;
+
+    if (connection) {
+      console.log("Connection update:", phone, connection);
+    }
+
+    /*
+      IMPORTANT:
+      Request pairing code when Baileys emits QR.
+      Do not request it before the connection is ready.
+    */
+
+    if (
+      generateCode &&
+      !state.creds.registered &&
+      qr &&
+      !pairingRequested
+    ) {
+      pairingRequested = true;
+
+      try {
+        console.log("QR event received. Requesting pairing code:", phone);
+
+        const code = await sock.requestPairingCode(phone);
+
+        console.log("Pairing code successfully generated:", phone);
+
+        finishPairing(null, code);
+      } catch (error) {
+        console.error("Pairing request error:", error);
+
+        finishPairing(error);
+      }
+    }
 
     if (connection === "open") {
       console.log("SCOFED BOT connected:", phone);
+
       await sendWelcomeOnce(sock, folder);
     }
 
     if (connection === "close") {
+      const statusCode =
+        lastDisconnect?.error?.output?.statusCode;
+
+      console.error("WHATSAPP CONNECTION CLOSED:", {
+        phone,
+        statusCode,
+        error: lastDisconnect?.error?.message
+      });
+
       if (sessions.get(phone) === sock) {
         sessions.delete(phone);
       }
 
-      const statusCode =
-        lastDisconnect?.error?.output?.statusCode;
+      if (generateCode && !state.creds.registered) {
+        finishPairing(
+          new Error(
+            "WhatsApp connection closed before pairing completed. Check Render Logs."
+          )
+        );
+
+        return;
+      }
 
       if (statusCode === DisconnectReason.loggedOut) {
         console.log("Account logged out:", phone);
@@ -91,6 +200,7 @@ async function startSession(phone, generateCode = false) {
 
       if (!reconnecting.has(phone)) {
         reconnecting.add(phone);
+
         await sleep(5000);
 
         try {
@@ -104,11 +214,37 @@ async function startSession(phone, generateCode = false) {
     }
   });
 
-  sock.ev.on("messages.upsert", async ({ messages }) => {
-    for (const msg of messages) {
-      if (!msg.message || msg.key.remoteJid === "status@broadcast") {
-        continue;
+  /*
+    Wait for the QR event and pairing code.
+  */
+
+  if (pairingPromise) {
+    try {
+      return await pairingPromise;
+    } catch (error) {
+      if (sessions.get(phone) === sock) {
+        sessions.delete(phone);
       }
+
+      throw error;
+    }
+  }
+
+  return null;
+}
+
+/* MESSAGE COMMANDS */
+
+function registerCommands(sock) {
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify") return;
+
+    for (const msg of messages) {
+      if (!msg.message) continue;
+
+      if (msg.key.fromMe) continue;
+
+      if (msg.key.remoteJid === "status@broadcast") continue;
 
       const from = msg.key.remoteJid;
 
@@ -151,16 +287,9 @@ async function startSession(phone, generateCode = false) {
       }
     }
   });
-
-  if (generateCode && !state.creds.registered) {
-    await sleep(3000);
-    return await sock.requestPairingCode(phone);
-  }
-
-  return null;
 }
 
-/* SCOFED BOT BLACK & GOLD WEBSITE */
+/* WEBSITE - BLACK & GOLD */
 
 app.get("/", (req, res) => {
   res.send(`<!DOCTYPE html>
@@ -171,9 +300,7 @@ app.get("/", (req, res) => {
 <title>SCOFED BOT</title>
 
 <style>
-* {
-  box-sizing: border-box;
-}
+* { box-sizing: border-box; }
 
 body {
   margin: 0;
@@ -245,9 +372,7 @@ button {
   cursor: pointer;
 }
 
-button:disabled {
-  opacity: 0.5;
-}
+button:disabled { opacity: 0.5; }
 
 #result {
   margin-top: 20px;
@@ -313,14 +438,13 @@ async function getCode() {
   const result = document.getElementById("result");
 
   if (!/^[1-9][0-9]{7,14}$/.test(phone)) {
-    result.textContent =
-      "Enter a valid number with country code.";
+    result.textContent = "Enter a valid number with country code.";
     return;
   }
 
   button.disabled = true;
   button.textContent = "PLEASE WAIT...";
-  result.textContent = "Generating pairing code...";
+  result.textContent = "Connecting to WhatsApp...";
 
   try {
     const response = await fetch("/api/pair", {
@@ -344,8 +468,7 @@ async function getCode() {
 
       result.querySelector(".code").textContent = data.code;
     } else {
-      result.textContent =
-        data.message || "No code returned.";
+      result.textContent = data.message || "No code returned.";
     }
 
   } catch (error) {
@@ -373,6 +496,12 @@ app.post("/api/pair", async (req, res) => {
     });
   }
 
+  if (sessions.has(phone)) {
+    return res.status(409).json({
+      message: "A session is already running for this number."
+    });
+  }
+
   const now = Date.now();
   const last = lastRequests.get(phone) || 0;
 
@@ -382,20 +511,14 @@ app.post("/api/pair", async (req, res) => {
     });
   }
 
-  if (sessions.has(phone)) {
-    return res.status(409).json({
-      message: "Session already exists. Check your WhatsApp."
-    });
-  }
-
   lastRequests.set(phone, now);
 
   try {
     const code = await startSession(phone, true);
 
     if (!code) {
-      return res.json({
-        message: "This number is already registered."
+      return res.status(409).json({
+        message: "A saved session already exists for this number."
       });
     }
 
@@ -405,10 +528,21 @@ app.post("/api/pair", async (req, res) => {
     console.error("Pairing error:", error);
 
     return res.status(500).json({
-      message: "Pairing failed. Check server logs."
+      message: error.message || "Pairing failed. Check server logs."
     });
   }
 });
+
+/* HEALTH CHECK */
+
+app.get("/health", (req, res) => {
+  res.json({
+    status: "online",
+    service: "SCOFED BOT"
+  });
+});
+
+/* START SERVER */
 
 app.listen(PORT, () => {
   console.log("SCOFED BOT running on port " + PORT);
