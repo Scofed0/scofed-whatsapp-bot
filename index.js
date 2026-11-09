@@ -92,25 +92,41 @@ function registerCommands(sock) {
 
 🔥 Karibu kutumia SCOFED BOT!`
           });
-        }
-
-        else if (command === "!ping") {
+        } else if (command === "!ping") {
           await sock.sendMessage(from, {
             text: "SCOFED BOT is online! 🚀"
           });
-        }
-
-        else if (command === "!owner") {
+        } else if (command === "!owner") {
           await sock.sendMessage(from, {
             text: "👑 OWNER: SCOFED"
           });
         }
-
       } catch (error) {
         console.error("Command error:", error);
       }
     }
   });
+}
+
+/* RECONNECT */
+
+async function reconnectSession(phone) {
+  if (reconnecting.has(phone) || starting.has(phone)) return;
+
+  reconnecting.add(phone);
+
+  try {
+    await sleep(3000);
+
+    if (!sessions.has(phone)) {
+      console.log("Reconnecting WhatsApp:", phone);
+      await startSession(phone, false);
+    }
+  } catch (error) {
+    console.error("Reconnect error:", error);
+  } finally {
+    reconnecting.delete(phone);
+  }
 }
 
 /* START WHATSAPP SESSION */
@@ -120,11 +136,42 @@ async function startSession(phone, generateCode = false) {
     throw new Error("A connection is already starting.");
   }
 
+  if (sessions.has(phone)) {
+    throw new Error("A WhatsApp session is already running.");
+  }
+
   starting.add(phone);
 
   const folder = path.join(__dirname, "sessions", phone);
 
   let sock;
+  let pairingSettled = false;
+  let pairingRequested = false;
+  let commandsRegistered = false;
+  let pairingTimer;
+
+  let resolvePairing;
+  let rejectPairing;
+
+  const pairingPromise = generateCode
+    ? new Promise((resolve, reject) => {
+        resolvePairing = resolve;
+        rejectPairing = reject;
+      })
+    : null;
+
+  function finishPairing(error, code) {
+    if (pairingSettled) return;
+
+    pairingSettled = true;
+    clearTimeout(pairingTimer);
+
+    if (error) {
+      rejectPairing(error);
+    } else {
+      resolvePairing(code);
+    }
+  }
 
   try {
     await fs.promises.mkdir(folder, { recursive: true });
@@ -133,13 +180,14 @@ async function startSession(phone, generateCode = false) {
       await useMultiFileAuthState(folder);
 
     if (generateCode && state.creds.registered) {
-      throw new Error("A saved WhatsApp session already exists.");
+      throw new Error(
+        "A saved WhatsApp session already exists. Do not request another pairing code."
+      );
     }
 
     sock = makeWASocket({
       auth: state,
       logger: pino({ level: "silent" }),
-      printQRInTerminal: false,
       browser: ["SCOFED BOT", "Chrome", "1.0.0"],
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
@@ -152,45 +200,75 @@ async function startSession(phone, generateCode = false) {
 
     sock.ev.on("creds.update", saveCreds);
 
-    let pairingSettled = false;
-    let commandsRegistered = false;
-    let pairingTimer;
+    /* PAIRING TIMEOUT */
 
-    let resolvePairing;
-    let rejectPairing;
+    if (pairingPromise) {
+      pairingTimer = setTimeout(() => {
+        finishPairing(
+          new Error("Pairing timed out. Please try again later.")
+        );
 
-    const pairingPromise = generateCode
-      ? new Promise((resolve, reject) => {
-          resolvePairing = resolve;
-          rejectPairing = reject;
+        if (sessions.get(phone) === sock) {
+          sessions.delete(phone);
+        }
 
-          pairingTimer = setTimeout(() => {
-            finishPairing(
-              new Error("Pairing timed out. Please try again.")
-            );
-          }, 45000);
-        })
-      : null;
-
-    function finishPairing(error, code) {
-      if (pairingSettled) return;
-
-      pairingSettled = true;
-      clearTimeout(pairingTimer);
-
-      if (error) {
-        rejectPairing(error);
-      } else {
-        resolvePairing(code);
-      }
+        try {
+          sock.end(new Error("Pairing timeout"));
+        } catch (error) {
+          console.error("Socket cleanup error:", error);
+        }
+      }, 90000);
     }
 
+    /* CONNECTION EVENTS */
+
     sock.ev.on("connection.update", async update => {
-      const { connection, lastDisconnect } = update;
+      const { connection, lastDisconnect, qr } = update;
 
       if (connection) {
         console.log("Connection update:", phone, connection);
       }
+
+      /*
+        REQUEST PAIRING CODE
+        Wait for Baileys QR event before requesting code.
+      */
+
+      if (
+        qr &&
+        generateCode &&
+        !pairingRequested &&
+        !state.creds.registered
+      ) {
+        pairingRequested = true;
+
+        try {
+          console.log("Requesting pairing code:", phone);
+
+          const code = await sock.requestPairingCode(phone);
+
+          console.log("Pairing code generated:", phone);
+
+          finishPairing(null, code);
+
+        } catch (error) {
+          console.error("Pairing request error:", error);
+
+          finishPairing(error);
+
+          if (sessions.get(phone) === sock) {
+            sessions.delete(phone);
+          }
+
+          try {
+            sock.end(error);
+          } catch (endError) {
+            console.error("Socket cleanup error:", endError);
+          }
+        }
+      }
+
+      /* CONNECTED */
 
       if (connection === "open") {
         console.log("👑 SCOFED BOT CONNECTED:", phone);
@@ -198,25 +276,66 @@ async function startSession(phone, generateCode = false) {
         if (!commandsRegistered) {
           registerCommands(sock);
           commandsRegistered = true;
+
           console.log("Commands registered:", phone);
         }
 
         await sendWelcomeOnce(sock, folder);
       }
 
+      /* CONNECTION CLOSED */
+
       if (connection === "close") {
         const statusCode =
           lastDisconnect?.error?.output?.statusCode;
 
+        const errorMessage =
+          lastDisconnect?.error?.message || "Unknown error";
+
         console.error("WHATSAPP CONNECTION CLOSED:", {
           phone,
           statusCode,
-          error: lastDisconnect?.error?.message
+          error: errorMessage
         });
 
         if (sessions.get(phone) === sock) {
           sessions.delete(phone);
         }
+
+        /* LOGGED OUT: DO NOT RECONNECT */
+
+        if (statusCode === DisconnectReason.loggedOut) {
+          console.log(
+            "WhatsApp logged out. Manual session recovery may be required:",
+            phone
+          );
+
+          finishPairing(
+            new Error("WhatsApp rejected the saved session. Check server logs.")
+          );
+
+          return;
+        }
+
+        /*
+          RESTART REQUIRED
+          WhatsApp may close the old socket during pairing.
+        */
+
+        if (statusCode === DisconnectReason.restartRequired) {
+          console.log("WhatsApp requires a socket restart:", phone);
+
+          if (pairingPromise && !pairingSettled) {
+            finishPairing(
+              new Error("Connection restarted before pairing code was returned.")
+            );
+          }
+
+          await reconnectSession(phone);
+          return;
+        }
+
+        /* OTHER ERRORS DURING FIRST PAIRING */
 
         if (generateCode && !state.creds.registered) {
           finishPairing(
@@ -228,69 +347,29 @@ async function startSession(phone, generateCode = false) {
           return;
         }
 
-        if (statusCode === DisconnectReason.loggedOut) {
-          console.log("Account logged out:", phone);
-          return;
-        }
+        /* NORMAL RECONNECTION */
 
-        if (!reconnecting.has(phone)) {
-          reconnecting.add(phone);
-
-          await sleep(5000);
-
-          try {
-            if (!sessions.has(phone)) {
-              await startSession(phone, false);
-            }
-          } catch (error) {
-            console.error("Reconnect error:", error);
-          } finally {
-            reconnecting.delete(phone);
-          }
-        }
+        await reconnectSession(phone);
       }
     });
 
-    /*
-      REQUEST PAIRING CODE
-      Wait briefly after creating the socket.
-      Do not depend on receiving a QR event.
-    */
+    /* RETURN PAIRING CODE */
 
     if (pairingPromise) {
-      (async () => {
-        try {
-          await sleep(3000);
-
-          if (pairingSettled) return;
-
-          if (state.creds.registered) {
-            finishPairing(
-              new Error("WhatsApp is already registered.")
-            );
-            return;
-          }
-
-          console.log("Requesting pairing code:", phone);
-
-          const code = await sock.requestPairingCode(phone);
-
-          console.log("Pairing code generated:", phone);
-
-          finishPairing(null, code);
-
-        } catch (error) {
-          console.error("Pairing request error:", error);
-          finishPairing(error);
-        }
-      })();
-
       return await pairingPromise;
     }
 
     return null;
 
+  } catch (error) {
+    if (sock && sessions.get(phone) === sock) {
+      sessions.delete(phone);
+    }
+
+    throw error;
+
   } finally {
+    clearTimeout(pairingTimer);
     starting.delete(phone);
   }
 }
