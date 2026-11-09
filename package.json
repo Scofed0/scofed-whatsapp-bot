@@ -1,15 +1,18 @@
 {
   "name": "scofed-whatsapp-bot",
   "version": "1.0.0",
-  "description": "SCOFED WhatsApp Multi-User Bot",
+  "description": "SCOFED BOT",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": "20.x"
+  },
   "dependencies": {
     "@whiskeysockets/baileys": "6.7.24",
-    "express": "latest",
-    "pino": "latest",
-    "dotenv": "latest"
+    "express": "4.21.2",
+    "pino": "9.6.0",
+    "qrcode": "1.5.4"
   }
 }
