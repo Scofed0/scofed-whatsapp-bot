@@ -20,6 +20,7 @@ const PORT = process.env.PORT || 3000;
 const sessions = new Map();
 const lastRequests = new Map();
 const reconnecting = new Set();
+const starting = new Set();
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -53,186 +54,6 @@ async function sendWelcomeOnce(sock, folder) {
   }
 }
 
-/* START WHATSAPP SESSION */
-
-async function startSession(phone, generateCode = false) {
-  const folder = path.join(__dirname, "sessions", phone);
-
-  await fs.promises.mkdir(folder, { recursive: true });
-
-  const { state, saveCreds } =
-    await useMultiFileAuthState(folder);
-
-  if (generateCode && state.creds.registered) {
-    return null;
-  }
-
-  const sock = makeWASocket({
-    auth: state,
-    logger: pino({ level: "silent" }),
-    printQRInTerminal: false,
-    browser: ["SCOFED BOT", "Chrome", "1.0.0"],
-    connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 60000,
-    keepAliveIntervalMs: 30000,
-    markOnlineOnConnect: false,
-    syncFullHistory: false
-  });
-
-  sessions.set(phone, sock);
-
-  sock.ev.on("creds.update", saveCreds);
-
-  let pairingRequested = false;
-  let pairingSettled = false;
-  let pairingTimer;
-
-  let resolvePairing;
-  let rejectPairing;
-
-  const pairingPromise = generateCode
-    ? new Promise((resolve, reject) => {
-        resolvePairing = resolve;
-        rejectPairing = reject;
-
-        pairingTimer = setTimeout(() => {
-          if (!pairingSettled) {
-            pairingSettled = true;
-
-            reject(
-              new Error("Timed out waiting for WhatsApp pairing QR event.")
-            );
-
-            if (sessions.get(phone) === sock) {
-              sessions.delete(phone);
-            }
-
-            sock.end(new Error("Pairing timeout"));
-          }
-        }, 45000);
-      })
-    : null;
-
-  function finishPairing(error, code) {
-    if (pairingSettled) return;
-
-    pairingSettled = true;
-
-    clearTimeout(pairingTimer);
-
-    if (error) {
-      rejectPairing(error);
-    } else {
-      resolvePairing(code);
-    }
-  }
-
-  sock.ev.on("connection.update", async update => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (connection) {
-      console.log("Connection update:", phone, connection);
-    }
-
-    /*
-      IMPORTANT:
-      Request pairing code when Baileys emits QR.
-      Do not request it before the connection is ready.
-    */
-
-    if (
-      generateCode &&
-      !state.creds.registered &&
-      qr &&
-      !pairingRequested
-    ) {
-      pairingRequested = true;
-
-      try {
-        console.log("QR event received. Requesting pairing code:", phone);
-
-        const code = await sock.requestPairingCode(phone);
-
-        console.log("Pairing code successfully generated:", phone);
-
-        finishPairing(null, code);
-      } catch (error) {
-        console.error("Pairing request error:", error);
-
-        finishPairing(error);
-      }
-    }
-
-    if (connection === "open") {
-      console.log("SCOFED BOT connected:", phone);
-
-      await sendWelcomeOnce(sock, folder);
-    }
-
-    if (connection === "close") {
-      const statusCode =
-        lastDisconnect?.error?.output?.statusCode;
-
-      console.error("WHATSAPP CONNECTION CLOSED:", {
-        phone,
-        statusCode,
-        error: lastDisconnect?.error?.message
-      });
-
-      if (sessions.get(phone) === sock) {
-        sessions.delete(phone);
-      }
-
-      if (generateCode && !state.creds.registered) {
-        finishPairing(
-          new Error(
-            "WhatsApp connection closed before pairing completed. Check Render Logs."
-          )
-        );
-
-        return;
-      }
-
-      if (statusCode === DisconnectReason.loggedOut) {
-        console.log("Account logged out:", phone);
-        return;
-      }
-
-      if (!reconnecting.has(phone)) {
-        reconnecting.add(phone);
-
-        await sleep(5000);
-
-        try {
-          await startSession(phone, false);
-        } catch (error) {
-          console.error("Reconnect error:", error);
-        } finally {
-          reconnecting.delete(phone);
-        }
-      }
-    }
-  });
-
-  /*
-    Wait for the QR event and pairing code.
-  */
-
-  if (pairingPromise) {
-    try {
-      return await pairingPromise;
-    } catch (error) {
-      if (sessions.get(phone) === sock) {
-        sessions.delete(phone);
-      }
-
-      throw error;
-    }
-  }
-
-  return null;
-}
-
 /* MESSAGE COMMANDS */
 
 function registerCommands(sock) {
@@ -241,9 +62,7 @@ function registerCommands(sock) {
 
     for (const msg of messages) {
       if (!msg.message) continue;
-
       if (msg.key.fromMe) continue;
-
       if (msg.key.remoteJid === "status@broadcast") continue;
 
       const from = msg.key.remoteJid;
@@ -273,20 +92,207 @@ function registerCommands(sock) {
 
 🔥 Karibu kutumia SCOFED BOT!`
           });
-        } else if (command === "!ping") {
+        }
+
+        else if (command === "!ping") {
           await sock.sendMessage(from, {
             text: "SCOFED BOT is online! 🚀"
           });
-        } else if (command === "!owner") {
+        }
+
+        else if (command === "!owner") {
           await sock.sendMessage(from, {
             text: "👑 OWNER: SCOFED"
           });
         }
+
       } catch (error) {
         console.error("Command error:", error);
       }
     }
   });
+}
+
+/* START WHATSAPP SESSION */
+
+async function startSession(phone, generateCode = false) {
+  if (starting.has(phone)) {
+    throw new Error("A connection is already starting.");
+  }
+
+  starting.add(phone);
+
+  const folder = path.join(__dirname, "sessions", phone);
+
+  let sock;
+
+  try {
+    await fs.promises.mkdir(folder, { recursive: true });
+
+    const { state, saveCreds } =
+      await useMultiFileAuthState(folder);
+
+    if (generateCode && state.creds.registered) {
+      throw new Error("A saved WhatsApp session already exists.");
+    }
+
+    sock = makeWASocket({
+      auth: state,
+      logger: pino({ level: "silent" }),
+      printQRInTerminal: false,
+      browser: ["SCOFED BOT", "Chrome", "1.0.0"],
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
+      keepAliveIntervalMs: 30000,
+      markOnlineOnConnect: false,
+      syncFullHistory: false
+    });
+
+    sessions.set(phone, sock);
+
+    sock.ev.on("creds.update", saveCreds);
+
+    let pairingSettled = false;
+    let commandsRegistered = false;
+    let pairingTimer;
+
+    let resolvePairing;
+    let rejectPairing;
+
+    const pairingPromise = generateCode
+      ? new Promise((resolve, reject) => {
+          resolvePairing = resolve;
+          rejectPairing = reject;
+
+          pairingTimer = setTimeout(() => {
+            finishPairing(
+              new Error("Pairing timed out. Please try again.")
+            );
+          }, 45000);
+        })
+      : null;
+
+    function finishPairing(error, code) {
+      if (pairingSettled) return;
+
+      pairingSettled = true;
+      clearTimeout(pairingTimer);
+
+      if (error) {
+        rejectPairing(error);
+      } else {
+        resolvePairing(code);
+      }
+    }
+
+    sock.ev.on("connection.update", async update => {
+      const { connection, lastDisconnect } = update;
+
+      if (connection) {
+        console.log("Connection update:", phone, connection);
+      }
+
+      if (connection === "open") {
+        console.log("👑 SCOFED BOT CONNECTED:", phone);
+
+        if (!commandsRegistered) {
+          registerCommands(sock);
+          commandsRegistered = true;
+          console.log("Commands registered:", phone);
+        }
+
+        await sendWelcomeOnce(sock, folder);
+      }
+
+      if (connection === "close") {
+        const statusCode =
+          lastDisconnect?.error?.output?.statusCode;
+
+        console.error("WHATSAPP CONNECTION CLOSED:", {
+          phone,
+          statusCode,
+          error: lastDisconnect?.error?.message
+        });
+
+        if (sessions.get(phone) === sock) {
+          sessions.delete(phone);
+        }
+
+        if (generateCode && !state.creds.registered) {
+          finishPairing(
+            new Error(
+              "WhatsApp connection closed before pairing completed. Check Render Logs."
+            )
+          );
+
+          return;
+        }
+
+        if (statusCode === DisconnectReason.loggedOut) {
+          console.log("Account logged out:", phone);
+          return;
+        }
+
+        if (!reconnecting.has(phone)) {
+          reconnecting.add(phone);
+
+          await sleep(5000);
+
+          try {
+            if (!sessions.has(phone)) {
+              await startSession(phone, false);
+            }
+          } catch (error) {
+            console.error("Reconnect error:", error);
+          } finally {
+            reconnecting.delete(phone);
+          }
+        }
+      }
+    });
+
+    /*
+      REQUEST PAIRING CODE
+      Wait briefly after creating the socket.
+      Do not depend on receiving a QR event.
+    */
+
+    if (pairingPromise) {
+      (async () => {
+        try {
+          await sleep(3000);
+
+          if (pairingSettled) return;
+
+          if (state.creds.registered) {
+            finishPairing(
+              new Error("WhatsApp is already registered.")
+            );
+            return;
+          }
+
+          console.log("Requesting pairing code:", phone);
+
+          const code = await sock.requestPairingCode(phone);
+
+          console.log("Pairing code generated:", phone);
+
+          finishPairing(null, code);
+
+        } catch (error) {
+          console.error("Pairing request error:", error);
+          finishPairing(error);
+        }
+      })();
+
+      return await pairingPromise;
+    }
+
+    return null;
+
+  } finally {
+    starting.delete(phone);
+  }
 }
 
 /* WEBSITE - BLACK & GOLD */
@@ -496,7 +502,7 @@ app.post("/api/pair", async (req, res) => {
     });
   }
 
-  if (sessions.has(phone)) {
+  if (sessions.has(phone) || starting.has(phone)) {
     return res.status(409).json({
       message: "A session is already running for this number."
     });
@@ -518,7 +524,7 @@ app.post("/api/pair", async (req, res) => {
 
     if (!code) {
       return res.status(409).json({
-        message: "A saved session already exists for this number."
+        message: "No pairing code returned."
       });
     }
 
@@ -545,5 +551,5 @@ app.get("/health", (req, res) => {
 /* START SERVER */
 
 app.listen(PORT, () => {
-  console.log("SCOFED BOT running on port " + PORT);
+  console.log("👑 SCOFED BOT running on port " + PORT);
 });
