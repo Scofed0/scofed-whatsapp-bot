@@ -3,8 +3,9 @@ require("dotenv").config();
 
 const express = require("express");
 const pino = require("pino");
-const path = require("path");
+const QRCode = require("qrcode");
 const fs = require("fs");
+const path = require("path");
 
 const {
   default: makeWASocket,
@@ -16,64 +17,30 @@ const app = express();
 app.use(express.json({ limit: "10kb" }));
 
 const PORT = process.env.PORT || 3000;
-
 const sessions = new Map();
-const lastRequests = new Map();
-const reconnecting = new Set();
+const pairingCodes = new Map();
+const qrImages = new Map();
+const statuses = new Map();
 const starting = new Set();
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-/* WELCOME MESSAGE */
-
-async function sendWelcomeOnce(sock, folder) {
-  try {
-    const marker = path.join(folder, ".welcome-sent");
-
-    if (fs.existsSync(marker)) return;
-
-    const welcomePath = path.join(__dirname, "welcome.txt");
-
-    let message = "👑 KARIBU KWENYE SCOFED BOT!\n\n";
-
-    if (fs.existsSync(welcomePath)) {
-      message = await fs.promises.readFile(welcomePath, "utf8");
-    }
-
-    const userId = sock.user.id;
-    const jid =
-      userId.split(":")[0].split("@")[0] + "@s.whatsapp.net";
-
-    await sock.sendMessage(jid, { text: message });
-
-    await fs.promises.writeFile(marker, "sent");
-
-    console.log("Welcome sent:", jid);
-  } catch (error) {
-    console.error("Welcome error:", error);
-  }
-}
-
-/* MESSAGE COMMANDS */
 
 function registerCommands(sock) {
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
     for (const msg of messages) {
-      if (!msg.message) continue;
-      if (msg.key.fromMe) continue;
-      if (msg.key.remoteJid === "status@broadcast") continue;
+      if (!msg.message || msg.key.fromMe) continue;
 
       const from = msg.key.remoteJid;
+      if (!from || from === "status@broadcast") continue;
 
-      const messageText =
+      const body =
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
-        msg.message.imageMessage?.caption ||
         "";
 
-      const command = messageText.trim().toLowerCase();
+      const command = body.trim().toLowerCase();
 
       try {
         if (command === "!menu" || command === "!help") {
@@ -82,15 +49,11 @@ function registerCommands(sock) {
 ┃ 👑 OWNER: SCOFED
 ┃ ⚙️ PREFIX: !
 ┃
-┃ 📌 GENERAL
 ┃ !menu
 ┃ !ping
 ┃ !owner
 ┃ !help
-┃
-╰━━━━━━━━━━━━━━━━━━╯
-
-🔥 Karibu kutumia SCOFED BOT!`
+╰━━━━━━━━━━━━━━━━━━╯`
           });
         } else if (command === "!ping") {
           await sock.sendMessage(from, {
@@ -102,76 +65,22 @@ function registerCommands(sock) {
           });
         }
       } catch (error) {
-        console.error("Command error:", error);
+        console.error("Command error:", error.message);
       }
     }
   });
 }
 
-/* RECONNECT */
-
-async function reconnectSession(phone) {
-  if (reconnecting.has(phone) || starting.has(phone)) return;
-
-  reconnecting.add(phone);
-
-  try {
-    await sleep(3000);
-
-    if (!sessions.has(phone)) {
-      console.log("Reconnecting WhatsApp:", phone);
-      await startSession(phone, false);
-    }
-  } catch (error) {
-    console.error("Reconnect error:", error);
-  } finally {
-    reconnecting.delete(phone);
-  }
-}
-
-/* START WHATSAPP SESSION */
-
-async function startSession(phone, generateCode = false) {
-  if (starting.has(phone)) {
-    throw new Error("A connection is already starting.");
-  }
-
-  if (sessions.has(phone)) {
-    throw new Error("A WhatsApp session is already running.");
+async function startSession(phone, method) {
+  if (starting.has(phone) || sessions.has(phone)) {
+    throw new Error("A session is already running.");
   }
 
   starting.add(phone);
+  statuses.set(phone, "connecting");
 
   const folder = path.join(__dirname, "sessions", phone);
-
   let sock;
-  let pairingSettled = false;
-  let pairingRequested = false;
-  let commandsRegistered = false;
-  let pairingTimer;
-
-  let resolvePairing;
-  let rejectPairing;
-
-  const pairingPromise = generateCode
-    ? new Promise((resolve, reject) => {
-        resolvePairing = resolve;
-        rejectPairing = reject;
-      })
-    : null;
-
-  function finishPairing(error, code) {
-    if (pairingSettled) return;
-
-    pairingSettled = true;
-    clearTimeout(pairingTimer);
-
-    if (error) {
-      rejectPairing(error);
-    } else {
-      resolvePairing(code);
-    }
-  }
 
   try {
     await fs.promises.mkdir(folder, { recursive: true });
@@ -179,9 +88,9 @@ async function startSession(phone, generateCode = false) {
     const { state, saveCreds } =
       await useMultiFileAuthState(folder);
 
-    if (generateCode && state.creds.registered) {
+    if (state.creds.registered) {
       throw new Error(
-        "A saved WhatsApp session already exists. Do not request another pairing code."
+        "This account already has saved credentials. Do not create a new pairing request."
       );
     }
 
@@ -189,446 +98,251 @@ async function startSession(phone, generateCode = false) {
       auth: state,
       logger: pino({ level: "silent" }),
       browser: ["SCOFED BOT", "Chrome", "1.0.0"],
-      connectTimeoutMs: 60000,
-      defaultQueryTimeoutMs: 60000,
-      keepAliveIntervalMs: 30000,
+      printQRInTerminal: false,
       markOnlineOnConnect: false,
-      syncFullHistory: false
+      syncFullHistory: false,
+      connectTimeoutMs: 60000
     });
 
     sessions.set(phone, sock);
 
     sock.ev.on("creds.update", saveCreds);
 
-    /* PAIRING TIMEOUT */
-
-    if (pairingPromise) {
-      pairingTimer = setTimeout(() => {
-        finishPairing(
-          new Error("Pairing timed out. Please try again later.")
-        );
-
-        if (sessions.get(phone) === sock) {
-          sessions.delete(phone);
-        }
-
-        try {
-          sock.end(new Error("Pairing timeout"));
-        } catch (error) {
-          console.error("Socket cleanup error:", error);
-        }
-      }, 90000);
-    }
-
-    /* CONNECTION EVENTS */
-
     sock.ev.on("connection.update", async update => {
-      const { connection, lastDisconnect, qr } = update;
+      const { connection, qr, lastDisconnect } = update;
 
-      if (connection) {
-        console.log("Connection update:", phone, connection);
-      }
-
-      /*
-        REQUEST PAIRING CODE
-        Wait for Baileys QR event before requesting code.
-      */
-
-      if (
-        qr &&
-        generateCode &&
-        !pairingRequested &&
-        !state.creds.registered
-      ) {
-        pairingRequested = true;
-
+      if (qr && method === "qr") {
         try {
-          console.log("Requesting pairing code:", phone);
-
-          const code = await sock.requestPairingCode(phone);
-
-          console.log("Pairing code generated:", phone);
-
-          finishPairing(null, code);
-
+          qrImages.set(phone, await QRCode.toDataURL(qr));
+          statuses.set(phone, "waiting_for_scan");
         } catch (error) {
-          console.error("Pairing request error:", error);
-
-          finishPairing(error);
-
-          if (sessions.get(phone) === sock) {
-            sessions.delete(phone);
-          }
-
-          try {
-            sock.end(error);
-          } catch (endError) {
-            console.error("Socket cleanup error:", endError);
-          }
+          console.error("QR generation error:", error.message);
         }
       }
-
-      /* CONNECTED */
 
       if (connection === "open") {
-        console.log("👑 SCOFED BOT CONNECTED:", phone);
-
-        if (!commandsRegistered) {
-          registerCommands(sock);
-          commandsRegistered = true;
-
-          console.log("Commands registered:", phone);
-        }
-
-        await sendWelcomeOnce(sock, folder);
+        statuses.set(phone, "connected");
+        pairingCodes.delete(phone);
+        qrImages.delete(phone);
+        registerCommands(sock);
+        console.log("SCOFED BOT connected.");
       }
 
-      /* CONNECTION CLOSED */
-
       if (connection === "close") {
-        const statusCode =
+        const code =
           lastDisconnect?.error?.output?.statusCode;
 
-        const errorMessage =
-          lastDisconnect?.error?.message || "Unknown error";
-
-        console.error("WHATSAPP CONNECTION CLOSED:", {
-          phone,
-          statusCode,
-          error: errorMessage
-        });
+        statuses.set(phone, "disconnected");
 
         if (sessions.get(phone) === sock) {
           sessions.delete(phone);
         }
 
-        /* LOGGED OUT: DO NOT RECONNECT */
-
-        if (statusCode === DisconnectReason.loggedOut) {
-          console.log(
-            "WhatsApp logged out. Manual session recovery may be required:",
-            phone
-          );
-
-          finishPairing(
-            new Error("WhatsApp rejected the saved session. Check server logs.")
-          );
-
-          return;
+        if (code === DisconnectReason.loggedOut) {
+          console.log("WhatsApp session logged out.");
+        } else {
+          console.log("Connection closed:", code);
         }
-
-        /*
-          RESTART REQUIRED
-          WhatsApp may close the old socket during pairing.
-        */
-
-        if (statusCode === DisconnectReason.restartRequired) {
-          console.log("WhatsApp requires a socket restart:", phone);
-
-          if (pairingPromise && !pairingSettled) {
-            finishPairing(
-              new Error("Connection restarted before pairing code was returned.")
-            );
-          }
-
-          await reconnectSession(phone);
-          return;
-        }
-
-        /* OTHER ERRORS DURING FIRST PAIRING */
-
-        if (generateCode && !state.creds.registered) {
-          finishPairing(
-            new Error(
-              "WhatsApp connection closed before pairing completed. Check Render Logs."
-            )
-          );
-
-          return;
-        }
-
-        /* NORMAL RECONNECTION */
-
-        await reconnectSession(phone);
       }
     });
 
-    /* RETURN PAIRING CODE */
+    if (method === "pair") {
+      await sleep(5000);
 
-    if (pairingPromise) {
-      return await pairingPromise;
+      if (!sessions.has(phone)) {
+        throw new Error("WhatsApp connection closed before pairing.");
+      }
+
+      const code = await sock.requestPairingCode(phone);
+      pairingCodes.set(phone, code);
     }
 
-    return null;
+    return { phone, method };
 
   } catch (error) {
     if (sock && sessions.get(phone) === sock) {
       sessions.delete(phone);
     }
-
+    statuses.set(phone, "failed");
     throw error;
-
   } finally {
-    clearTimeout(pairingTimer);
     starting.delete(phone);
   }
 }
 
-/* WEBSITE - BLACK & GOLD */
+/* WEBSITE */
 
 app.get("/", (req, res) => {
   res.send(`<!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SCOFED BOT</title>
-
 <style>
-* { box-sizing: border-box; }
-
-body {
-  margin: 0;
-  min-height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 20px;
-  background: #080808;
-  color: white;
-  font-family: Arial, sans-serif;
+*{box-sizing:border-box}
+body{
+  margin:0;background:#080808;color:white;
+  font-family:Arial,sans-serif;
+  min-height:100vh;display:grid;place-items:center;padding:20px
 }
-
-.container {
-  width: 100%;
-  max-width: 420px;
-  padding: 30px 22px;
-  text-align: center;
-  background: #141414;
-  border: 1px solid #c9a227;
-  border-radius: 18px;
-  box-shadow: 0 0 25px rgba(201,162,39,0.15);
+.card{
+  width:100%;max-width:420px;text-align:center;
+  background:#151515;border:1px solid #d4af37;
+  border-radius:18px;padding:28px 20px;
+  box-shadow:0 0 25px #d4af3725
 }
-
-.logo {
-  width: 85px;
-  height: 85px;
-  margin: auto;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: 2px solid #d4af37;
-  border-radius: 50%;
-  font-size: 42px;
-  color: #d4af37;
+.logo{
+  width:80px;height:80px;border:2px solid #d4af37;
+  border-radius:50%;display:grid;place-items:center;
+  margin:auto;color:#d4af37;font-size:38px
 }
-
-h1 {
-  color: #d4af37;
-  letter-spacing: 2px;
+h1{color:#d4af37;letter-spacing:3px}
+p{color:#aaa;line-height:1.5;font-size:14px}
+input{
+  width:100%;padding:15px;margin-top:15px;
+  background:#080808;color:white;
+  border:1px solid #d4af37;border-radius:8px;font-size:16px
 }
-
-.subtitle {
-  color: #aaa;
-  font-size: 14px;
-  line-height: 1.6;
+button{
+  width:100%;padding:14px;margin-top:12px;
+  border:0;border-radius:8px;
+  background:linear-gradient(90deg,#b8860b,#f5d76e);
+  font-weight:bold;cursor:pointer
 }
-
-input {
-  width: 100%;
-  padding: 15px;
-  margin-top: 20px;
-  border: 1px solid #c9a227;
-  border-radius: 9px;
-  background: #080808;
-  color: white;
-  font-size: 16px;
-}
-
-button {
-  width: 100%;
-  padding: 15px;
-  margin-top: 15px;
-  border: none;
-  border-radius: 9px;
-  background: linear-gradient(90deg,#b8860b,#f5d76e);
-  color: #080808;
-  font-weight: bold;
-  cursor: pointer;
-}
-
-button:disabled { opacity: 0.5; }
-
-#result {
-  margin-top: 20px;
-  color: #f5d76e;
-  overflow-wrap: anywhere;
-  line-height: 1.7;
-}
-
-.code {
-  font-size: 25px;
-  font-weight: bold;
-  letter-spacing: 4px;
-  padding: 12px;
-  border: 1px dashed #d4af37;
-  border-radius: 8px;
-}
-
-.footer {
-  margin-top: 25px;
-  color: #777;
-  font-size: 12px;
-}
+button:disabled{opacity:.5}
+#result{margin-top:20px;overflow-wrap:anywhere}
+.code{font-size:25px;letter-spacing:4px;color:#f5d76e}
+#qr{width:220px;max-width:100%;margin-top:15px;background:white}
+.footer{font-size:11px;color:#777;margin-top:25px}
 </style>
 </head>
-
 <body>
-<div class="container">
-
+<div class="card">
   <div class="logo">👑</div>
-
   <h1>SCOFED BOT</h1>
-
-  <p class="subtitle">
-    Welcome to SCOFED BOT Pairing System.<br>
-    Connect your own WhatsApp account.
-  </p>
-
-  <input
-    id="phone"
-    type="tel"
-    placeholder="Country code + number"
-  >
-
-  <button id="pairBtn" onclick="getCode()">
-    GET PAIRING CODE
-  </button>
-
+  <p>Connect your own WhatsApp account.</p>
+  <input id="phone" placeholder="255XXXXXXXXX" type="tel">
+  <button id="pair" onclick="connect('pair')">PAIRING CODE</button>
+  <button id="qrbtn" onclick="connect('qr')">QR CODE</button>
   <div id="result"></div>
-
-  <p class="footer">
-    POWERED BY SCOFED • 2026
-  </p>
-
+  <img id="qr" hidden>
+  <div class="footer">POWERED BY SCOFED • 2026</div>
 </div>
-
 <script>
-async function getCode() {
-  const phone = document
-    .getElementById("phone")
-    .value.replace(/\\D/g, "");
+let timer;
 
-  const button = document.getElementById("pairBtn");
-  const result = document.getElementById("result");
+async function connect(method){
+  clearInterval(timer);
+  const phone=document.getElementById("phone").value.replace(/\\D/g,"");
+  const result=document.getElementById("result");
+  const qr=document.getElementById("qr");
+  const buttons=[document.getElementById("pair"),document.getElementById("qrbtn")];
 
-  if (!/^[1-9][0-9]{7,14}$/.test(phone)) {
-    result.textContent = "Enter a valid number with country code.";
+  if(!/^[1-9][0-9]{7,14}$/.test(phone)){
+    result.textContent="Enter a valid number with country code.";
     return;
   }
 
-  button.disabled = true;
-  button.textContent = "PLEASE WAIT...";
-  result.textContent = "Connecting to WhatsApp...";
+  buttons.forEach(b=>b.disabled=true);
+  qr.hidden=true;
+  result.textContent="Connecting...";
 
-  try {
-    const response = await fetch("/api/pair", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ phone })
+  try{
+    const response=await fetch("/api/connect",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({phone,method})
     });
 
-    const data = await response.json();
+    const data=await response.json();
+    if(!response.ok) throw new Error(data.message);
 
-    if (!response.ok) {
-      throw new Error(data.message || "Pairing failed.");
+    if(method==="pair"){
+      result.innerHTML="YOUR PAIRING CODE:<div class='code'></div><p>WhatsApp → Linked Devices → Link a Device → Link with phone number instead.</p>";
+      result.querySelector(".code").textContent=data.code;
+    }else{
+      result.textContent="Scan this QR using WhatsApp → Linked Devices → Link a Device.";
+      await refresh(phone);
+      timer=setInterval(()=>refresh(phone),3000);
     }
-
-    if (data.code) {
-      result.innerHTML =
-        "YOUR PAIRING CODE:<div class='code'></div>" +
-        "<p>Open WhatsApp → Linked Devices → Link a Device → Link with phone number.</p>";
-
-      result.querySelector(".code").textContent = data.code;
-    } else {
-      result.textContent = data.message || "No code returned.";
-    }
-
-  } catch (error) {
-    result.textContent = error.message;
-  } finally {
-    button.disabled = false;
-    button.textContent = "GET PAIRING CODE";
+  }catch(error){
+    result.textContent=error.message;
+  }finally{
+    buttons.forEach(b=>b.disabled=false);
   }
 }
-</script>
 
+async function refresh(phone){
+  try{
+    const response=await fetch("/api/status/"+encodeURIComponent(phone));
+    const data=await response.json();
+
+    if(data.qr){
+      document.getElementById("qr").src=data.qr;
+      document.getElementById("qr").hidden=false;
+    }
+
+    if(data.status==="connected"){
+      document.getElementById("result").textContent="WhatsApp Connected!";
+      clearInterval(timer);
+    }
+  }catch(e){}
+}
+</script>
 </body>
 </html>`);
 });
 
-/* PAIRING API */
+/* CONNECT */
 
-app.post("/api/pair", async (req, res) => {
-  const phone = String(req.body.phone || "")
-    .replace(/\D/g, "");
+app.post("/api/connect", async (req, res) => {
+  const phone = String(req.body.phone || "").replace(/\D/g, "");
+  const method = req.body.method;
 
   if (!/^[1-9][0-9]{7,14}$/.test(phone)) {
-    return res.status(400).json({
-      message: "Invalid WhatsApp number."
-    });
+    return res.status(400).json({ message: "Invalid phone number." });
   }
 
-  if (sessions.has(phone) || starting.has(phone)) {
-    return res.status(409).json({
-      message: "A session is already running for this number."
-    });
+  if (!["pair", "qr"].includes(method)) {
+    return res.status(400).json({ message: "Invalid connection method." });
   }
-
-  const now = Date.now();
-  const last = lastRequests.get(phone) || 0;
-
-  if (now - last < 60000) {
-    return res.status(429).json({
-      message: "Wait 60 seconds before trying again."
-    });
-  }
-
-  lastRequests.set(phone, now);
 
   try {
-    const code = await startSession(phone, true);
+    await startSession(phone, method);
 
-    if (!code) {
-      return res.status(409).json({
-        message: "No pairing code returned."
-      });
+    if (method === "pair") {
+      const code = pairingCodes.get(phone);
+      if (!code) {
+        return res.status(500).json({
+          message: "Pairing code was not generated. Check server logs."
+        });
+      }
+      return res.json({ code });
     }
 
-    return res.json({ code });
+    return res.json({ message: "QR session started." });
 
   } catch (error) {
-    console.error("Pairing error:", error);
-
-    return res.status(500).json({
-      message: error.message || "Pairing failed. Check server logs."
-    });
+    console.error("Connection error:", error);
+    return res.status(500).json({ message: error.message });
   }
 });
 
-/* HEALTH CHECK */
+/* STATUS */
 
-app.get("/health", (req, res) => {
+app.get("/api/status/:phone", (req, res) => {
+  const phone = String(req.params.phone).replace(/\D/g, "");
+
   res.json({
-    status: "online",
-    service: "SCOFED BOT"
+    status: statuses.get(phone) || "not_connected",
+    qr: qrImages.get(phone) || null
   });
 });
 
-/* START SERVER */
+app.get("/health", (req, res) => {
+  res.json({ status: "online", service: "SCOFED BOT" });
+});
 
 app.listen(PORT, () => {
-  console.log("👑 SCOFED BOT running on port " + PORT);
+  console.log("SCOFED BOT running on port " + PORT);
 });
